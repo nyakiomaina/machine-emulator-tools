@@ -29,6 +29,8 @@ env_logger = "0.11.5"
 async-mutex = "1.4"
 hex = "0.4"
 rstest = "0.22"
+memmap2 = "0.9.5"
+nix = { version = "0.29.0", features = ["ioctl"] }
 
 [build-dependencies]
 bindgen = "0.70.1"

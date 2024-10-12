@@ -15,10 +15,14 @@
 //
 
 use std::sync::Arc;
+use std::fs::{File, OpenOptions};
+use std::os::unix::io::AsRawFd;
+use std::env;
 
-use actix_web::{middleware::Logger, web::Data, App, HttpResponse, HttpServer, http::header::CONTENT_TYPE};
+use actix_web::{web, middleware::Logger, web::Data, App, HttpResponse, HttpServer, http::header::CONTENT_TYPE};
 use actix_web_validator::Json;
 use async_mutex::Mutex;
+use memmap2::MmapMut;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::Notify;
@@ -29,6 +33,25 @@ use crate::rollup::{
     AdvanceRequest, Exception, FinishRequest, InspectRequest, Notice, Report, RollupRequest,
     Voucher,
 };
+
+use crate::get_blkgetsize64;
+
+fn get_block_device_size(file: &File) -> Result<u64, HttpResponse> {
+    get_blkgetsize64(file).map_err(|_| {
+        HttpResponse::InternalServerError().body("Failed to get device size")
+    })
+}
+
+fn init_state_drive() -> String {
+    match env::var("STATE_DRIVE") {
+        Ok(value) => value,
+        Err(_) => {
+            let default_value = "/dev/pmem1".to_string();
+            env::set_var("STATE_DRIVE", &default_value);
+            default_value
+        }
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "request_type")]
@@ -44,12 +67,15 @@ pub fn create_server(
     config: &Config,
     rollup_fd: Arc<Mutex<RollupFd>>,
 ) -> std::io::Result<actix_server::Server> {
+    let state_drive = init_state_drive();
+
     let server = HttpServer::new(move || {
         let data = Data::new(Mutex::new(Context {
             rollup_fd: rollup_fd.clone(),
         }));
         App::new()
             .app_data(data)
+            .app_data(Data::new(state_drive.clone()))
             .wrap(Logger::default())
             .service(voucher)
             .service(notice)
@@ -57,6 +83,9 @@ pub fn create_server(
             .service(gio)
             .service(exception)
             .service(finish)
+            .service(raw_state_read)
+            .service(raw_state_write)
+            .service(raw_state_size)
     })
     .bind((config.http_address.as_str(), config.http_port))
     .map(|t| t)?
@@ -273,6 +302,83 @@ async fn finish(finish: Json<FinishRequest>, data: Data<Mutex<Context>>) -> Http
     HttpResponse::Ok()
         .append_header((CONTENT_TYPE, "application/json"))
         .json(http_rollup_request)
+}
+
+// read from raw state
+#[actix_web::get("/raw_state_read/{offset}/{size}")]
+async fn raw_state_read(
+    request_path: web::Path<(usize, usize)>, // Renamed `path` to avoid conflict.
+    state_drive: web::Data<String>,
+) -> HttpResponse {
+    let (offset, size) = request_path.into_inner();
+    let file = match File::open(&**state_drive) {
+        Ok(f) => f,
+        Err(_) => return HttpResponse::InternalServerError().body("Failed to open pmem device"),
+    };
+
+    let block_device_size = match get_block_device_size(&file) {
+        Ok(size) => size,
+        Err(resp) => return resp,
+    };
+
+    let mmap = unsafe { MmapMut::map_mut(&file).expect("Failed to map the file") }; // Use MmapMut.
+
+    if offset + size > block_device_size as usize {
+        return HttpResponse::BadRequest().body("Offset and size exceed memory bounds");
+    }
+
+    let data = &mmap[offset..offset + size];
+    HttpResponse::Ok()
+        .content_type("application/octet-stream")
+        .body(data.to_vec())
+}
+
+// write to raw state
+#[actix_web::post("/raw_state_write/{offset}")]
+async fn raw_state_write(
+    request_path: web::Path<usize>,
+    body: web::Bytes,
+    state_drive: web::Data<String>,
+) -> HttpResponse {
+    let offset = request_path.into_inner();
+    let file = match OpenOptions::new().read(true).write(true).open(&**state_drive) {
+        Ok(f) => f,
+        Err(_) => return HttpResponse::InternalServerError().body("Failed to open pmem device"),
+    };
+
+    let _block_device_size = match get_block_device_size(&file) {
+        Ok(size) => size,
+        Err(resp) => return resp,
+    };
+
+    let mut mmap = unsafe { MmapMut::map_mut(&file).expect("Failed to map the file") };
+
+    if offset + body.len() > mmap.len() {
+        return HttpResponse::BadRequest().body("Offset and size exceed memory bounds");
+    }
+
+    mmap[offset..offset + body.len()].copy_from_slice(&body);
+    mmap.flush().expect("Failed to flush the changes");
+
+    HttpResponse::Ok().body("Data written successfully")
+}
+
+// get raw state size
+#[actix_web::get("/raw_state_size")]
+async fn raw_state_size(
+    state_drive: web::Data<String>,
+) -> HttpResponse {
+    let file = match File::open(&**state_drive) {
+        Ok(f) => f,
+        Err(_) => return HttpResponse::InternalServerError().body("Failed to open pmem device"),
+    };
+
+    let block_device_size = match get_block_device_size(&file) {
+        Ok(size) => size,
+        Err(resp) => return resp,
+    };
+
+    HttpResponse::Ok().json(json!({ "size": block_device_size }))
 }
 
 #[derive(Debug, Clone, Serialize)]
